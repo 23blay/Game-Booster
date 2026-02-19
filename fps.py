@@ -17,10 +17,10 @@ except Exception:
     win32gui = None
     win32process = None
 
-CHECK_INTERVAL = 1.0
+CHECK_INTERVAL = 0.7
 RUNNING = False
 
-# Processes that usually consume resources while gaming.
+# Apps frequently active while gaming.
 BACKGROUND_TARGETS = {
     "chrome.exe",
     "msedge.exe",
@@ -31,15 +31,33 @@ BACKGROUND_TARGETS = {
     "onedrive.exe",
     "searchhost.exe",
     "widgets.exe",
+    "obs64.exe",
+    "teams.exe",
+}
+
+# Never throttle Windows critical components.
+PROTECTED_PROCESSES = {
+    "system",
+    "registry",
+    "dwm.exe",
+    "csrss.exe",
+    "wininit.exe",
+    "winlogon.exe",
+    "lsass.exe",
+    "services.exe",
+    "smss.exe",
+    "explorer.exe",
 }
 
 
 class Optimizer:
-    def __init__(self, status_label, detail_label):
+    def __init__(self, status_label, detail_label, turbo_var):
         self.status_label = status_label
         self.detail_label = detail_label
+        self.turbo_var = turbo_var
         self.last_boosted_pid = None
         self.original_priorities = {}
+        self.power_plan_applied = False
 
     @staticmethod
     def is_windows_supported():
@@ -59,14 +77,11 @@ class Optimizer:
         return pid
 
     def is_fullscreen_window(self, hwnd):
-        """Treat any borderless/fullscreen foreground app as a game target."""
         if not hwnd or not self.is_windows_supported():
             return False
-
-        if not win32gui.IsWindowVisible(hwnd):
+        if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
             return False
 
-        # Ignore desktop and shell windows.
         class_name = win32gui.GetClassName(hwnd)
         if class_name in {"Progman", "WorkerW", "Shell_TrayWnd"}:
             return False
@@ -81,57 +96,82 @@ class Optimizer:
         mon_width = mon_right - mon_left
         mon_height = mon_bottom - mon_top
 
-        # Allow tiny border mismatches for borderless fullscreen windows.
-        width_match = abs(width - mon_width) <= 8
-        height_match = abs(height - mon_height) <= 8
+        return abs(width - mon_width) <= 8 and abs(height - mon_height) <= 8
 
-        if not (width_match and height_match):
-            return False
-
-        # Exclude minimized windows.
-        return not win32gui.IsIconic(hwnd)
-
-    def set_process_high_priority(self, pid):
+    def set_process_high_priority(self, pid, turbo=False):
         try:
             proc = psutil.Process(pid)
             if pid not in self.original_priorities:
                 self.original_priorities[pid] = proc.nice()
 
-            proc.nice(psutil.HIGH_PRIORITY_CLASS)
+            target_priority = getattr(psutil, "HIGH_PRIORITY_CLASS", 0)
+            if turbo:
+                target_priority = getattr(psutil, "REALTIME_PRIORITY_CLASS", target_priority)
+
+            proc.nice(target_priority)
             proc.cpu_affinity(list(range(psutil.cpu_count(logical=True))))
+
+            if turbo:
+                try:
+                    proc.ionice(getattr(psutil, "IOPRIO_HIGH", 3))
+                except Exception:
+                    pass
+
             return proc
         except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
             return None
 
-    def tune_background_apps(self, active_pid):
+    def tune_background_apps(self, active_pid, turbo=False):
         throttled = 0
-        for proc in psutil.process_iter(["pid", "name"]):
+        candidates = []
+        for proc in psutil.process_iter(["pid", "name", "cpu_percent"]):
             try:
                 pid = proc.info["pid"]
                 name = (proc.info["name"] or "").lower()
-                if pid == active_pid:
+                if pid == active_pid or name in PROTECTED_PROCESSES:
                     continue
-
                 if name in BACKGROUND_TARGETS:
-                    psutil.Process(pid).nice(psutil.IDLE_PRIORITY_CLASS)
-                    throttled += 1
+                    candidates.append((proc, name, proc.info.get("cpu_percent", 0.0)))
+            except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+                continue
+
+        # In turbo mode lower all target background apps.
+        if turbo:
+            selected = candidates
+        else:
+            # Otherwise only lower the most CPU-active to stay safer.
+            selected = sorted(candidates, key=lambda item: item[2], reverse=True)[:5]
+
+        for proc, _, _ in selected:
+            try:
+                proc.nice(getattr(psutil, "IDLE_PRIORITY_CLASS", proc.nice()))
+                throttled += 1
             except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
                 continue
 
         return throttled
 
     def apply_system_tweaks(self):
-        """Enable high performance power profile when possible."""
+        if self.power_plan_applied:
+            return
         try:
-            # High performance GUID (built-in on Windows)
             subprocess.run(
                 ["powercfg", "/SETACTIVE", "SCHEME_MIN"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
+            self.power_plan_applied = True
         except Exception:
             pass
+
+    def restore_priorities(self):
+        for pid, original_priority in list(self.original_priorities.items()):
+            try:
+                psutil.Process(pid).nice(original_priority)
+            except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+                pass
+        self.original_priorities.clear()
 
     def update_status(self, text, detail, color):
         self.status_label.config(text=text, fg=color)
@@ -144,31 +184,35 @@ class Optimizer:
         while RUNNING:
             pid = self.get_foreground_pid()
             hwnd = self.get_foreground_window()
+            turbo = self.turbo_var.get()
 
             if pid and hwnd and self.is_fullscreen_window(hwnd):
-                proc = self.set_process_high_priority(pid)
+                proc = self.set_process_high_priority(pid, turbo=turbo)
                 if proc:
-                    throttled = self.tune_background_apps(pid)
+                    throttled = self.tune_background_apps(pid, turbo=turbo)
                     self.last_boosted_pid = pid
+                    mode = "TURBO" if turbo else "BALANCED"
                     self.update_status(
-                        text=f"BOOSTING: {proc.name()}",
-                        detail=f"Fullscreen detected • PID {pid} • throttled {throttled} background app(s)",
+                        text=f"BOOSTING {mode}: {proc.name()}",
+                        detail=f"Fullscreen lock • PID {pid} • tuned {throttled} background app(s)",
                         color="#0f4c1a",
                     )
                 else:
                     self.update_status(
-                        text="Detected fullscreen app (limited permissions)",
-                        detail="Run as administrator for deeper process priority tuning.",
+                        text="Fullscreen app detected (needs admin)",
+                        detail="Run as Administrator to unlock maximum process priority control.",
                         color="#8a6d00",
                     )
             else:
                 self.update_status(
                     text="Idle - waiting for fullscreen application",
-                    detail="Start any game/app in fullscreen or borderless fullscreen mode.",
+                    detail="Launch your game fullscreen/borderless, then keep this running.",
                     color="#666666",
                 )
 
             time.sleep(CHECK_INTERVAL)
+
+        self.restore_priorities()
 
 
 def start():
@@ -177,7 +221,7 @@ def start():
         return
     RUNNING = True
     status_label.config(text="Monitoring...", fg="#555555")
-    detail_label.config(text="Initializing booster engine...")
+    detail_label.config(text="Booster engine warming up...")
     threading.Thread(target=optimizer.monitor, daemon=True).start()
 
 
@@ -185,13 +229,13 @@ def stop():
     global RUNNING
     RUNNING = False
     status_label.config(text="Stopped", fg="#999999")
-    detail_label.config(text="All active monitoring has been disabled.")
+    detail_label.config(text="Monitoring disabled. Priorities restored where possible.")
 
 
 # ===== UI =====
 root = tk.Tk()
-root.title("Extreme Fullscreen Game Booster")
-root.geometry("560x280")
+root.title("FPS Booster Pro")
+root.geometry("600x320")
 root.configure(bg="white")
 root.resizable(False, False)
 
@@ -200,8 +244,8 @@ style.theme_use("clam")
 
 title = tk.Label(
     root,
-    text="Extreme Fullscreen Game Booster",
-    font=("Segoe UI", 17, "bold"),
+    text="FPS Booster Pro",
+    font=("Segoe UI", 18, "bold"),
     bg="white",
     fg="#101010",
 )
@@ -209,12 +253,12 @@ title.pack(pady=(20, 8))
 
 subtitle = tk.Label(
     root,
-    text="Auto-detects any fullscreen app and applies aggressive performance tuning",
+    text="High-performance boosts for any fullscreen app to reduce choppy gameplay",
     font=("Segoe UI", 9),
     bg="white",
     fg="#666666",
 )
-subtitle.pack(pady=(0, 12))
+subtitle.pack(pady=(0, 10))
 
 status_label = tk.Label(
     root,
@@ -227,12 +271,24 @@ status_label.pack(pady=4)
 
 detail_label = tk.Label(
     root,
-    text="Press Start to enable real-time fullscreen detection and boosting.",
+    text="Press Start to enable live fullscreen detection and performance tuning.",
     font=("Segoe UI", 10),
     bg="white",
     fg="#666666",
 )
 detail_label.pack(pady=4)
+
+turbo_var = tk.BooleanVar(value=True)
+turbo_check = tk.Checkbutton(
+    root,
+    text="Turbo mode (maximum boost, may affect multitasking)",
+    variable=turbo_var,
+    bg="white",
+    fg="#333333",
+    activebackground="white",
+    font=("Segoe UI", 9),
+)
+turbo_check.pack(pady=(8, 0))
 
 button_frame = tk.Frame(root, bg="white")
 button_frame.pack(pady=24)
@@ -261,6 +317,6 @@ stop_btn = tk.Button(
 )
 stop_btn.grid(row=0, column=1, padx=10)
 
-optimizer = Optimizer(status_label, detail_label)
+optimizer = Optimizer(status_label, detail_label, turbo_var)
 
 root.mainloop()
